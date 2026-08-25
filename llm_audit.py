@@ -75,7 +75,7 @@ def _fuse_check(source: str, prompt_hash: str) -> None:
 
 def _audit_path() -> Path:
     """动态解析审计路径 (支持 LLM_AUDIT_PATH 覆盖, 测试隔离用)。"""
-    return Path(os.environ.get("LLM_AUDIT_PATH", "data/llm_audit.jsonl"))
+    return Path(os.environ.get("LLM_AUDIT_PATH", "llm_audit.jsonl"))
 
 
 def audit_compaction_start(source: str, trigger: str, dropped: list[dict],
