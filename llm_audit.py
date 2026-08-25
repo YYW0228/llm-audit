@@ -1,0 +1,269 @@
+"""
+pulse/llm_audit.py — Model-visible = Logged 运行时不变量 (简化版)
+
+不变量: 任何发送给模型的请求, 其完整输入必须在调用前落盘。
+审计路径 data/llm_audit.jsonl 可 100% 重建模型所见 (prompt 全量 + 元数据)。
+
+用法 (调用点接入样板 — 对调用方透明):
+    from pulse.llm_audit import audited_post
+    resp = audited_post(url, headers, json=body, timeout=45, source="subagent.review")
+
+    # 原 httpx.post 直接替换为 audited_post, 其余参数语义一致。
+
+审计:
+    uv run python -m scripts.audit_reconstruct --days 7     # 可重建率 + 循环检测
+    uv run python -m scripts.audit_reconstruct --ci         # CI 门禁模式 (非 100% 退出 1)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+AUDIT_PATH = Path(os.environ.get("LLM_AUDIT_PATH", "llm_audit.jsonl"))
+_lock = threading.Lock()
+
+# 循环熔断: 同 source+prompt 在窗口内 >= 阈值 → 拒绝调用 (调用方 fallback)
+LOOP_WINDOW_S = 600
+FUSE_THRESHOLD = int(os.environ.get("LLM_AUDIT_FUSE_THRESHOLD", "5"))
+
+
+class LoopGuardError(RuntimeError):
+    """疑似死循环, 调用被熔断。调用方应降级 (fallback/重试策略)。"""
+
+
+def _fuse_check(source: str, prompt_hash: str) -> None:
+    """调用前在线熔断检查: 10 分钟窗口内同 source+hash 达到阈值即拒绝。
+
+    LLM_AUDIT_FUSE=off 可关闭 (测试/调试); 读的是同一审计流, 无额外状态。
+    """
+    if os.environ.get("LLM_AUDIT_FUSE", "on") == "off":
+        return
+    p = _audit_path()
+    if not p.exists():
+        return
+    now = time.time()
+    n = 0
+    try:
+        with p.open(encoding="utf-8") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if e.get("kind") != "request":
+                    continue
+                if e.get("source") != source or e.get("prompt_hash") != prompt_hash:
+                    continue
+                if now - (e.get("ts_epoch") or 0) <= LOOP_WINDOW_S:
+                    n += 1
+    except OSError:
+        return  # 审计不可读时不能阻塞业务
+    if n >= FUSE_THRESHOLD:
+        raise LoopGuardError(
+            f"疑似死循环: {source} 同 prompt {n} 次/{LOOP_WINDOW_S}s, 已熔断 "
+            f"(阈值 {FUSE_THRESHOLD}, LLM_AUDIT_FUSE=off 可关)"
+        )
+
+
+def _audit_path() -> Path:
+    """动态解析审计路径 (支持 LLM_AUDIT_PATH 覆盖, 测试隔离用)。"""
+    return Path(os.environ.get("LLM_AUDIT_PATH", "data/llm_audit.jsonl"))
+
+
+def audit_compaction_start(source: str, trigger: str, dropped: list[dict],
+                           kept_count: int, summary: str | None = None) -> str:
+    """压缩过程成为一等审计事件 (方案 A: 重建"模型实际看到的有效历史")。
+
+    dropped: 被折叠的原始消息列表 (仅记录 role/len/hash, 不保留全文 —
+             压缩语义即丢弃, 全文不再对模型可见); kept_count: 压缩后消息数。
+    summary: 摘要型压缩 (如 handoff) 时, 真正注入模型的摘要文本 —
+             记录其 hash + 前 200 字预览, 证明"摘要来自哪些原文"可校验。
+    返回 compaction_id, 供 audit_compaction_end 配对 (孤儿检测: start 无 end)。
+    """
+    compaction_id = f"cmp_{uuid.uuid4().hex[:10]}"
+    dropped_meta = [{
+        "role": m.get("role", "?"),
+        "len": len(m.get("content", "")),
+        "hash": hashlib.md5(str(m.get("content", "")).encode()).hexdigest()[:16],
+    } for m in dropped]
+    dropped_total = hashlib.md5(
+        json.dumps([m["hash"] for m in dropped_meta], ensure_ascii=False).encode()
+    ).hexdigest()[:16]
+    entry: dict[str, Any] = {
+        "kind": "compaction/start",
+        "compaction_id": compaction_id,
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ts_epoch": time.time(),
+        "source": source,
+        "trigger": trigger,
+        "dropped_count": len(dropped_meta),
+        "dropped": dropped_meta,
+        "dropped_total_hash": dropped_total,
+        "kept_count": kept_count,
+    }
+    if summary:
+        entry["summary_hash"] = hashlib.md5(summary.encode()).hexdigest()[:16]
+        entry["summary_preview"] = summary[:200]
+    _append(entry)
+    return compaction_id
+
+
+def audit_compaction_end(compaction_id: str, ok: bool, error: str | None = None) -> None:
+    """压缩收尾事件; 与 start 配对, 孤儿 = start 无 end (崩溃/异常中道)。"""
+    _append({
+        "kind": "compaction/end",
+        "compaction_id": compaction_id,
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ts_epoch": time.time(),
+        "ok": ok,
+        "error": error,
+    })
+
+
+def audit_component_swap(component: str, old_desc: str, new_desc: str,
+                         source: str = "manual") -> None:
+    """组件热替换审计: 记录替换前后身份 (Cordis 自演化场景的证据链挂钩)。
+
+    没有这条记录, "这次替换到底改了什么"不可证明; 有它, 模型换后端/
+    换模型/换权限的行为全部可追溯, 与 model-visible=logged 同链。
+    """
+    _append({
+        "kind": "component/swap",
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ts_epoch": time.time(),
+        "component": component,
+        "old": old_desc,
+        "new": new_desc,
+        "source": source,
+    })
+
+
+@dataclass
+class CompactionRecord:
+    """统一压缩入口的返回: 压缩后消息 + 折叠元数据 + 审计配对 id。"""
+    compacted: list[dict]
+    dropped: list[dict]
+    compaction_id: str
+
+
+# PostCompact 强制规则 (混乱税增量 2): 压缩后自动重灌关键约束。
+# 软性提示词在长周期/压缩后快速失效 — 每次压缩都机械重注入硬规则。
+POST_COMPACT_RULES = (
+    "〔压缩后强制规则 — 必须遵守〕\n"
+    "1. 所有回答必须带 [文档: 文件名 | 章节: xx] 引用; 无引用回答必须显式标注'知识缺口'。\n"
+    "2. 禁止声称完成了未经验证的工作; 测试/编译失败不得报成功。\n"
+    "3. 禁止整文件重复读取; 优先 search_files 定位或 read_file 局部读取。\n"
+    "4. 所有后续 LLM 调用必须经审计通道 (audited_post), 不得绕过。"
+)
+
+
+def compact_and_audit(messages: list[dict], history: list[dict] | None,
+                      trigger: str, source: str,
+                      keep_last_n: int = 6) -> CompactionRecord | None:
+    """统一压缩入口 — 压缩规则 + 强制审计副作用 (start 事件, 不可绕过)。
+
+    所有新压缩逻辑 (丢弃式/摘要式) 必须经此函数或显式调用
+    audit_compaction_start/end, 否则压缩发生但审计缺失 = 局部真理。
+    返回 None 表示无需压缩 (历史太短)。
+    """
+    if not history or len(history) <= keep_last_n:
+        return None  # 历史太短, 压缩无意义
+    keep = history[-keep_last_n:]  # 保留最近 keep_last_n 条
+    compacted = [messages[0]] + keep
+    for m in messages[-1:]:        # 当前问题消息保留完整
+        compacted.append(m)
+    # PostCompact 强制规则注入: system 之后立即重灌硬约束
+    compacted.insert(1, {"role": "system", "content": POST_COMPACT_RULES})
+    # 被折叠 = system 之后、keep 之前的原始历史消息
+    dropped = messages[1:-1][:len(history) - keep_last_n] if len(messages) > 1 else []
+    cid = audit_compaction_start(source, trigger, dropped, len(compacted))
+    return CompactionRecord(compacted=compacted, dropped=dropped, compaction_id=cid)
+
+
+def _append(entry: dict[str, Any]) -> None:
+    """线程安全追加一条审计记录; 写失败只告警, 绝不阻塞模型调用。"""
+    try:
+        p = _audit_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with _lock, p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as exc:  # 审计故障不允许打断业务
+        print(f"[llm_audit] WARN 写入失败: {exc}", flush=True)
+
+
+def _prompt_hash(messages: list[dict]) -> str:
+    return hashlib.md5(json.dumps(messages, ensure_ascii=False).encode()).hexdigest()[:16]
+
+
+def audited_post(
+    url: str,
+    headers: dict | None = None,
+    json: dict | None = None,
+    timeout: float = 45,
+    source: str = "unknown",
+    **kwargs: Any,
+):
+    """httpx.post 的审计包装: 调用前完整落盘请求, 调用后记录结果。
+
+    参数与 httpx.post 一致 (url/headers/json/timeout), 额外 source 标注调用方。
+    """
+    import httpx
+
+    call_id = f"llm_{uuid.uuid4().hex[:10]}"
+    messages = (json or {}).get("messages") or []
+    body: dict[str, Any] = {
+        "call_id": call_id,
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ts_epoch": time.time(),
+        "source": source,
+        "url": url,
+        "model": (json or {}).get("model", "?"),
+        "temperature": (json or {}).get("temperature"),
+        "max_tokens": (json or {}).get("max_tokens"),
+        "messages": messages,          # 全量: 模型所见 = 已记录
+        "prompt_hash": _prompt_hash(messages),
+        "reconstructable": bool(messages) and all(
+            isinstance(m.get("content"), str) and m["content"].strip() for m in messages
+        ),
+    }
+    # eval 批量评测标记: 循环检测/熔断排除 (eval 合法重复同 query)
+    if os.environ.get("LLM_AUDIT_EVAL") == "1":
+        body["eval"] = True
+    _fuse_check(source, body["prompt_hash"])   # 熔断在落盘前: 拒绝的调用不产生记录
+    _append({"kind": "request", **body})
+
+    t0 = time.time()
+    try:
+        resp = httpx.post(url, headers=headers, json=json, timeout=timeout, **kwargs)
+        status = getattr(resp, "status_code", None)  # mock/异常响应对象防御
+        _append({
+            "kind": "result",
+            "call_id": call_id,
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "ts_epoch": time.time(),
+            "status": status,
+            "duration_ms": round((time.time() - t0) * 1000, 1),
+            "ok": status == 200,
+            "error": None,
+        })
+        return resp
+    except Exception as exc:
+        _append({
+            "kind": "result",
+            "call_id": call_id,
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "ts_epoch": time.time(),
+            "status": None,
+            "duration_ms": round((time.time() - t0) * 1000, 1),
+            "ok": False,
+            "error": str(exc),
+        })
+        raise
