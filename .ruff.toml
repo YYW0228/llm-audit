@@ -1,0 +1,3 @@
+# Tier2 收敛配置 (pregate-patrol 2026-08-31 生成)
+# 原则: line-length 适配 + 默认规则集; 语义债务不 ignore (保持真实基线)
+line-length = 100

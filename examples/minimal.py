@@ -1,6 +1,8 @@
 """最小接入示例 — audited_post 一行替换 httpx.post."""
 import httpx
+
 from llm_audit import audited_post
+
 
 def chat(api_key: str, prompt: str) -> str:
     url = "https://api.example.com/v1/chat/completions"
