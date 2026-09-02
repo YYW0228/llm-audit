@@ -195,7 +195,7 @@ def _append(entry: dict[str, Any]) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
         with _lock, p.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as exc:  # 审计故障不允许打断业务
+    except Exception as exc:  # noqa: BLE001 — 审计故障不允许打断业务 (故意盲捕)
         print(f"[llm_audit] WARN 写入失败: {exc}", flush=True)
 
 
